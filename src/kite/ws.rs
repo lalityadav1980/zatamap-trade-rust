@@ -31,6 +31,30 @@ fn env_u64(key: &str) -> Option<u64> {
     std::env::var(key).ok().and_then(|v| v.trim().parse::<u64>().ok())
 }
 
+#[derive(Clone, Debug)]
+pub struct TickLogConfig {
+    pub enabled: bool,
+    pub interval: Duration,
+}
+
+impl TickLogConfig {
+    /// Default: enabled=true, interval=500ms.
+    ///
+    /// Env:
+    /// - TICK_LOG_FULL (default 1/on; set 0/off to disable)
+    /// - TICK_LOG_INTERVAL_MS (default 500)
+    pub fn from_env() -> Self {
+        let enabled = env_bool_default("TICK_LOG_FULL", true);
+        let interval_ms = env_u64("TICK_LOG_INTERVAL_MS")
+            .filter(|v| *v > 0)
+            .unwrap_or(500);
+        Self {
+            enabled,
+            interval: Duration::from_millis(interval_ms),
+        }
+    }
+}
+
 /// Zerodha Kite ticker websocket client.
 ///
 /// Responsibilities:
@@ -46,6 +70,7 @@ pub struct KiteTickerWs {
     tokens: Arc<Vec<i32>>,
     allowed: Arc<HashSet<i32>>,
     store: Arc<TickStore>,
+    log: TickLogConfig,
 }
 
 impl KiteTickerWs {
@@ -54,6 +79,7 @@ impl KiteTickerWs {
         access_token: String,
         tokens: Vec<i32>,
         store: Arc<TickStore>,
+        log: TickLogConfig,
     ) -> Self {
         let allowed: HashSet<i32> = tokens.iter().copied().collect();
         Self {
@@ -62,6 +88,7 @@ impl KiteTickerWs {
             tokens: Arc::new(tokens),
             allowed: Arc::new(allowed),
             store,
+            log,
         }
     }
 
@@ -132,30 +159,11 @@ impl KiteTickerWs {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Subscribe in chunks to keep message sizes reasonable.
-        const CHUNK: usize = 300;
-        for chunk in self.tokens.chunks(CHUNK) {
-            let msg = json!({"a":"subscribe","v":chunk});
-            write
-                .send(Message::Text(msg.to_string()))
-                .await
-                .map_err(|e| AppError::KiteApi(format!("ws subscribe send failed: {e}")))?;
-
-            let mode_msg = json!({"a":"mode","v":["full", chunk]});
-            write
-                .send(Message::Text(mode_msg.to_string()))
-                .await
-                .map_err(|e| AppError::KiteApi(format!("ws mode send failed: {e}")))?;
-        }
-
+        self.subscribe_full(&mut write).await?;
         info!(token_count = self.tokens.len(), "subscribed + mode=full");
 
-        // Optional: print full decoded tick data (rate limited to avoid log floods).
-        // Default: ON
-        // Disable with: TICK_LOG_FULL=0
-        // Control rate with: TICK_LOG_INTERVAL_MS=500
-        let log_full_ticks = env_bool_default("TICK_LOG_FULL", true);
-        let log_interval_ms = env_u64("TICK_LOG_INTERVAL_MS").filter(|v| *v > 0).unwrap_or(500);
+        let log_full_ticks = self.log.enabled;
+        let log_interval = self.log.interval;
         let mut last_tick_log = std::time::Instant::now();
         let mut logged_first_per_token: HashSet<i32> = HashSet::new();
 
@@ -172,7 +180,7 @@ impl KiteTickerWs {
                             if self.allowed.contains(&t.instrument_token) {
                                 if log_full_ticks {
                                     let first_for_token = logged_first_per_token.insert(t.instrument_token);
-                                    let due = last_tick_log.elapsed() >= Duration::from_millis(log_interval_ms);
+                                    let due = last_tick_log.elapsed() >= log_interval;
                                     if first_for_token || due {
                                         let symbol = self
                                             .store
@@ -215,6 +223,28 @@ impl KiteTickerWs {
             }
         }
 
+        Ok(())
+    }
+
+    async fn subscribe_full(
+        &self,
+        write: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    ) -> Result<(), AppError> {
+        // Subscribe in chunks to keep message sizes reasonable.
+        const CHUNK: usize = 300;
+        for chunk in self.tokens.chunks(CHUNK) {
+            let msg = json!({"a":"subscribe","v":chunk});
+            write
+                .send(Message::Text(msg.to_string()))
+                .await
+                .map_err(|e| AppError::KiteApi(format!("ws subscribe send failed: {e}")))?;
+
+            let mode_msg = json!({"a":"mode","v":["full", chunk]});
+            write
+                .send(Message::Text(mode_msg.to_string()))
+                .await
+                .map_err(|e| AppError::KiteApi(format!("ws mode send failed: {e}")))?;
+        }
         Ok(())
     }
 }

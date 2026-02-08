@@ -10,7 +10,7 @@ mod ticks;
 
 use crate::core::AppError;
 use crate::kite::client::KiteClient;
-use crate::kite::ws::KiteTickerWs;
+use crate::kite::ws::{KiteTickerWs, TickLogConfig};
 use crate::ticks::{TickStore, TokenMeta};
 use crate::{core::AppConfig, core::AppState, db::Db};
 use std::sync::Arc;
@@ -94,13 +94,14 @@ async fn main() -> Result<(), AppError> {
             // For end-to-end runs we default to force=true so the token is fresh.
             let mut debug = false;
             let mut force = true;
+            let mut tick_log_enabled_override: Option<bool> = None;
             for a in args {
                 match a.as_str() {
                     "--debug" => debug = true,
                     "--force" => force = true,
                     "--no-force" => force = false,
-                    "--print-ticks" => std::env::set_var("TICK_LOG_FULL", "1"),
-                    "--no-print-ticks" => std::env::set_var("TICK_LOG_FULL", "0"),
+                    "--print-ticks" => tick_log_enabled_override = Some(true),
+                    "--no-print-ticks" => tick_log_enabled_override = Some(false),
                     _ => {
                         eprintln!("Unknown flag for e2e: {a}\n\n{}", usage());
                         std::process::exit(2);
@@ -108,7 +109,7 @@ async fn main() -> Result<(), AppError> {
                 }
             }
 
-            run_e2e(&user_id, debug, force).await?;
+            run_e2e(&user_id, debug, force, tick_log_enabled_override).await?;
         }
         "ticker" => {
             let user_id = args.next().unwrap_or_default();
@@ -116,17 +117,18 @@ async fn main() -> Result<(), AppError> {
                 eprintln!("Missing USER_ID\n\n{}", usage());
                 std::process::exit(2);
             }
+            let mut tick_log_enabled_override: Option<bool> = None;
             for a in args {
                 match a.as_str() {
-                    "--print-ticks" => std::env::set_var("TICK_LOG_FULL", "1"),
-                    "--no-print-ticks" => std::env::set_var("TICK_LOG_FULL", "0"),
+                    "--print-ticks" => tick_log_enabled_override = Some(true),
+                    "--no-print-ticks" => tick_log_enabled_override = Some(false),
                     _ => {
                         eprintln!("Unknown flag for ticker: {a}\n\n{}", usage());
                         std::process::exit(2);
                     }
                 }
             }
-            run_ticker(&user_id).await?;
+            run_ticker(&user_id, tick_log_enabled_override).await?;
         }
         "profile" | "holdings" => {
             let api_key =
@@ -230,12 +232,17 @@ async fn run_autologin(user_id: &str, debug: bool, force: bool) -> Result<(), Ap
     .await
 }
 
-async fn run_e2e(user_id: &str, debug: bool, force: bool) -> Result<(), AppError> {
+async fn run_e2e(
+    user_id: &str,
+    debug: bool,
+    force: bool,
+    tick_log_enabled_override: Option<bool>,
+) -> Result<(), AppError> {
     run_autologin(user_id, debug, force).await?;
-    run_ticker(user_id).await
+    run_ticker(user_id, tick_log_enabled_override).await
 }
 
-async fn run_ticker(user_id: &str) -> Result<(), AppError> {
+async fn run_ticker(user_id: &str, tick_log_enabled_override: Option<bool>) -> Result<(), AppError> {
     let config = AppConfig::from_env_ticker()?;
     let db = Db::connect(&config.database_url).await?;
     let state = AppState {
@@ -315,7 +322,11 @@ async fn run_ticker(user_id: &str) -> Result<(), AppError> {
 
     info!(user_id = user_id, os_type = %os_type, tokens = tokens.len(), "starting kite ticker ws");
 
-    let ws = KiteTickerWs::new(creds.api_key, access_token, tokens, state.ticks.clone());
+    let mut log = TickLogConfig::from_env();
+    if let Some(v) = tick_log_enabled_override {
+        log.enabled = v;
+    }
+    let ws = KiteTickerWs::new(creds.api_key, access_token, tokens, state.ticks.clone(), log);
     let handle = ws.spawn();
 
     // Periodic health logs (does not log individual ticks to avoid flooding).
