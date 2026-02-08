@@ -68,7 +68,14 @@ pub async fn refresh_trade_instruments(
     db: &crate::db::Db,
     kite: &KiteClient,
 ) -> Result<u64, AppError> {
+    let started = std::time::Instant::now();
+    println!("Instruments: fetching CSV from Kite...");
     let csv_text = kite.instruments_csv().await?;
+    println!(
+        "Instruments: downloaded CSV bytes={} elapsed_ms={}",
+        csv_text.len(),
+        started.elapsed().as_millis()
+    );
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
@@ -79,6 +86,11 @@ pub async fn refresh_trade_instruments(
         let r: KiteInstrumentCsvRow = rec?;
         rows.push(r);
     }
+    println!(
+        "Instruments: parsed_rows={} elapsed_ms={}",
+        rows.len(),
+        started.elapsed().as_millis()
+    );
 
     let allowed_names: HashSet<&'static str> = HashSet::from([
         "MIDCPNIFTY",
@@ -94,6 +106,8 @@ pub async fn refresh_trade_instruments(
     let specific_tokens: HashSet<i32> = HashSet::from([256265, 260105, 288009, 257801, 265]);
 
     let mut selected: Vec<KiteInstrumentCsvRow> = Vec::new();
+    let mut selected_specific: usize = 0;
+    let mut selected_index_opts: usize = 0;
     for r in rows {
         let is_specific = specific_tokens.contains(&r.instrument_token);
 
@@ -118,9 +132,23 @@ pub async fn refresh_trade_instruments(
         let is_index_option = segment_ok && exchange_ok && name_ok;
 
         if is_specific || is_index_option {
+            if is_specific {
+                selected_specific += 1;
+            }
+            if is_index_option {
+                selected_index_opts += 1;
+            }
             selected.push(r);
         }
     }
+
+    println!(
+        "Instruments: selected_total={} selected_specific={} selected_index_opts={} elapsed_ms={}",
+        selected.len(),
+        selected_specific,
+        selected_index_opts,
+        started.elapsed().as_millis()
+    );
 
     // Python overwrites name + symbol_full_name for these tokens.
     let name_mapping: HashMap<i32, &'static str> = HashMap::from([
@@ -188,5 +216,16 @@ pub async fn refresh_trade_instruments(
         });
     }
 
-    instrument_dao::replace_all_instruments(db, &upserts).await
+    println!(
+        "Instruments: writing to Postgres (delete + upsert) rows={} elapsed_ms={}",
+        upserts.len(),
+        started.elapsed().as_millis()
+    );
+    let n = instrument_dao::replace_all_instruments(db, &upserts).await?;
+    println!(
+        "Instruments: done upserted_rows={} total_elapsed_ms={}",
+        n,
+        started.elapsed().as_millis()
+    );
+    Ok(n)
 }

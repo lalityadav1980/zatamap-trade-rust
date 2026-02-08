@@ -20,10 +20,17 @@ pub struct InstrumentUpsert {
 
 pub async fn replace_all_instruments(db: &Db, instruments: &[InstrumentUpsert]) -> Result<u64, AppError> {
     let client = db.client();
+    let started = std::time::Instant::now();
+    println!("InstrumentDAO: BEGIN replace_all_instruments rows={}", instruments.len());
     client.batch_execute("BEGIN").await?;
 
     let r: Result<u64, AppError> = async {
-        client.execute("DELETE FROM trade.instrument", &[]).await?;
+        let deleted = client.execute("DELETE FROM trade.instrument", &[]).await?;
+        println!(
+            "InstrumentDAO: deleted_rows={} elapsed_ms={}",
+            deleted,
+            started.elapsed().as_millis()
+        );
 
         let stmt = client
             .prepare(
@@ -83,6 +90,14 @@ pub async fn replace_all_instruments(db: &Db, instruments: &[InstrumentUpsert]) 
                     ],
                 )
                 .await?;
+
+            if n % 5_000 == 0 {
+                println!(
+                    "InstrumentDAO: upsert_progress rows={} elapsed_ms={}",
+                    n,
+                    started.elapsed().as_millis()
+                );
+            }
         }
 
         Ok(n)
@@ -92,10 +107,20 @@ pub async fn replace_all_instruments(db: &Db, instruments: &[InstrumentUpsert]) 
     match r {
         Ok(n) => {
             client.batch_execute("COMMIT").await?;
+            println!(
+                "InstrumentDAO: COMMIT upserted_rows={} total_elapsed_ms={}",
+                n,
+                started.elapsed().as_millis()
+            );
             Ok(n)
         }
         Err(e) => {
             let _ = client.batch_execute("ROLLBACK").await;
+            println!(
+                "InstrumentDAO: ROLLBACK error='{}' total_elapsed_ms={}",
+                e,
+                started.elapsed().as_millis()
+            );
             Err(e)
         }
     }
