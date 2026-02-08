@@ -323,9 +323,17 @@ async fn run_ticker(user_id: &str, tick_log_enabled_override: Option<bool>) -> R
     info!(user_id = user_id, os_type = %os_type, tokens = tokens.len(), "starting kite ticker ws");
 
     let mut log = TickLogConfig::from_env();
+    let has_override = tick_log_enabled_override.is_some();
     if let Some(v) = tick_log_enabled_override {
         log.enabled = v;
     }
+
+    info!(
+        tick_log_enabled = log.enabled,
+        tick_log_interval_ms = log.interval.as_millis() as u64,
+        tick_log_overridden = has_override,
+        "ticker tick-log config"
+    );
     let ws = KiteTickerWs::new(creds.api_key, access_token, tokens, state.ticks.clone(), log);
     let handle = ws.spawn();
 
