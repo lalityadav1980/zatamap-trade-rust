@@ -4,6 +4,7 @@ mod bootstrap;
 mod core;
 mod dao;
 mod db;
+mod instruments;
 mod kite;
 
 use crate::core::AppError;

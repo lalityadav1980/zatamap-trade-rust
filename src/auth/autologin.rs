@@ -174,6 +174,12 @@ pub async fn maybe_autologin_for_os(
     }
 
     println!("AutoLogin: updated access_token in DB for user={user_id}");
+
+    // ------------------------------------------------------------ housekeeping
+    // Mirror the Python flow: after successful login, refresh instruments into Postgres.
+    let kite = crate::kite::client::KiteClient::new(&login.api_key, &session.access_token)?;
+    let n = crate::instruments::refresh_trade_instruments(&state.db, &kite).await?;
+    println!("AutoLogin: refreshed trade.instrument rows={n} for user={user_id}");
     Ok(())
 }
 async fn run_login_flow(

@@ -18,6 +18,11 @@ impl KiteClient {
             reqwest::header::AUTHORIZATION,
             HeaderValue::from_str(&auth).map_err(|e| AppError::KiteApi(e.to_string()))?,
         );
+        // Kite expects this in many endpoints.
+        headers.insert(
+            "X-Kite-Version",
+            HeaderValue::from_static("3"),
+        );
         let http = reqwest::Client::builder()
             .default_headers(headers)
             .build()?;
@@ -30,6 +35,20 @@ impl KiteClient {
 
     pub async fn holdings(&self) -> Result<Vec<Holding>, AppError> {
         self.get("/portfolio/holdings").await
+    }
+
+    /// Download the full instruments dump as CSV.
+    ///
+    /// Note: this is NOT a JSON envelope endpoint.
+    pub async fn instruments_csv(&self) -> Result<String, AppError> {
+        let url = format!("{KITE_BASE_URL}/instruments");
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(AppError::KiteApi(format!("HTTP {status}: {text}")));
+        }
+        Ok(text)
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, AppError> {
