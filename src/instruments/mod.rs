@@ -3,6 +3,7 @@ use crate::{
     dao::instrument_dao::{self, InstrumentUpsert},
     kite::client::KiteClient,
 };
+use chrono::{Duration, Local, NaiveDate};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -53,9 +54,25 @@ fn parse_strike_to_i64(strike: &Option<String>) -> Option<i64> {
     Some(f as i64)
 }
 
+fn parse_opt_f64(s: Option<String>) -> Option<f64> {
+    let s = s?.trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    s.parse::<f64>().ok()
+}
+
 fn parse_trading_symbol(tradingsymbol: &str, _expiry: Option<&str>) -> String {
     // Matches current Python behavior: just return tradingsymbol.
     tradingsymbol.to_string()
+}
+
+fn parse_expiry_date(expiry: Option<&str>) -> Option<NaiveDate> {
+    let s = expiry?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
 }
 
 /// Fetch all instruments from Kite and store a filtered subset into Postgres table `trade.instrument`.
@@ -69,6 +86,24 @@ pub async fn refresh_trade_instruments(
     kite: &KiteClient,
 ) -> Result<u64, AppError> {
     let started = std::time::Instant::now();
+
+    // Optional optimization: only keep instruments expiring within N days from today.
+    // Example: INSTRUMENT_EXPIRY_DAYS=7 keeps "current-week" expiries.
+    let expiry_days: Option<i64> = std::env::var("INSTRUMENT_EXPIRY_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|d| *d >= 0);
+    let today = Local::now().date_naive();
+    let expiry_end = expiry_days.map(|d| today + Duration::days(d));
+    if let Some(d) = expiry_days {
+        println!(
+            "Instruments: expiry filter enabled days={} window={}..={}",
+            d,
+            today,
+            expiry_end.unwrap()
+        );
+    }
+
     println!("Instruments: fetching CSV from Kite...");
     let csv_text = kite.instruments_csv().await?;
     println!(
@@ -131,11 +166,18 @@ pub async fn refresh_trade_instruments(
 
         let is_index_option = segment_ok && exchange_ok && name_ok;
 
-        if is_specific || is_index_option {
+        let expiry_ok = if let Some(end) = expiry_end {
+            let exp = parse_expiry_date(r.expiry.as_deref());
+            matches!(exp, Some(d) if d >= today && d <= end)
+        } else {
+            true
+        };
+
+        if is_specific || (is_index_option && expiry_ok) {
             if is_specific {
                 selected_specific += 1;
             }
-            if is_index_option {
+            if is_index_option && expiry_ok {
                 selected_index_opts += 1;
             }
             selected.push(r);
@@ -164,9 +206,9 @@ pub async fn refresh_trade_instruments(
         let mut tradingsymbol = clean_opt_string(r.tradingsymbol);
         let mut symbol = clean_opt_string(r.symbol);
         let mut name = clean_opt_string(r.name);
-        let last_price = clean_opt_string(r.last_price);
+        let last_price = parse_opt_f64(r.last_price);
         let expiry = clean_opt_string(r.expiry);
-        let tick_size = clean_opt_string(r.tick_size);
+        let tick_size = parse_opt_f64(r.tick_size);
 
         // Default symbol_full_name
         let symbol_full_name = match tradingsymbol.as_deref() {
@@ -221,7 +263,54 @@ pub async fn refresh_trade_instruments(
         upserts.len(),
         started.elapsed().as_millis()
     );
-    let n = instrument_dao::replace_all_instruments(db, &upserts).await?;
+
+    let use_bulk_copy = std::env::var("INSTRUMENT_BULK_COPY")
+        .ok()
+        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    // If we're filtering by expiry window, only refresh the selected tokens (don't wipe the whole table).
+    let delete_all = expiry_end.is_none();
+    if use_bulk_copy {
+        println!(
+            "Instruments: using bulk COPY (delete_all={})",
+            delete_all
+        );
+    }
+
+    // Optional optimization: if every selected instrument_token already exists in DB, skip delete/upsert.
+    // This avoids a slow remote upsert when data is already present.
+    let skip_if_present = std::env::var("INSTRUMENT_SKIP_IF_PRESENT")
+        .ok()
+        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if skip_if_present {
+        let tokens: Vec<i32> = upserts.iter().map(|u| u.instrument_token).collect();
+        if !tokens.is_empty() {
+            let existing = instrument_dao::count_existing_instrument_tokens(db, &tokens).await?;
+            if existing as usize == tokens.len() {
+                println!(
+                    "Instruments: skip DB write (all tokens already present) tokens={} elapsed_ms={}",
+                    tokens.len(),
+                    started.elapsed().as_millis()
+                );
+                return Ok(tokens.len() as u64);
+            }
+            println!(
+                "Instruments: DB has {}/{} tokens; continuing with upsert",
+                existing,
+                tokens.len()
+            );
+        }
+    }
+
+    let n = if use_bulk_copy {
+        instrument_dao::replace_instruments_copy(db, &upserts, delete_all).await?
+    } else if delete_all {
+        instrument_dao::replace_all_instruments(db, &upserts).await?
+    } else {
+        instrument_dao::replace_instruments_by_tokens(db, &upserts).await?
+    };
     println!(
         "Instruments: done upserted_rows={} total_elapsed_ms={}",
         n,
