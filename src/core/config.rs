@@ -74,6 +74,60 @@ impl AppConfig {
             startup_autologin_force,
         })
     }
+
+    /// Config loader for the `ticker` CLI command.
+    ///
+    /// Unlike `from_env()`, this does not require `KITE_CALLBACK_URL` because
+    /// the websocket ticker connects directly using api_key + access_token.
+    pub fn from_env_ticker() -> Result<Self, AppError> {
+        let server_addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
+        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".into());
+            let port = std::env::var("PGPORT").unwrap_or_else(|_| "5432".into());
+            let db = std::env::var("PGDATABASE").unwrap_or_else(|_| "zatamap_trade".into());
+            let user = std::env::var("PGUSER").unwrap_or_else(|_| "zatamap".into());
+            let pass = std::env::var("PGPASSWORD").unwrap_or_else(|_| "".into());
+            let sslmode = std::env::var("PGSSLMODE").ok();
+
+            let mut parts = vec![
+                format!("host={host}"),
+                format!("port={port}"),
+                format!("dbname={db}"),
+                format!("user={user}"),
+            ];
+            if !pass.is_empty() {
+                parts.push(format!("password={pass}"));
+            }
+            if let Some(sslmode) = sslmode {
+                parts.push(format!("sslmode={sslmode}"));
+            }
+            parts.join(" ")
+        });
+
+        let kite_callback_url = std::env::var("KITE_CALLBACK_URL").unwrap_or_default();
+        let os_type = std::env::var("OS_TYPE").unwrap_or_else(|_| normalize_os(std::env::consts::OS));
+
+        let startup_autologin_user_id = std::env::var("STARTUP_AUTOLOGIN_USER_ID")
+            .ok()
+            .or_else(|| std::env::var("AUTOLOGIN_USER_ID").ok())
+            .filter(|s| !s.trim().is_empty());
+        let startup_autologin_os_type = std::env::var("STARTUP_AUTOLOGIN_OS_TYPE")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let startup_autologin_debug = parse_bool_env("STARTUP_AUTOLOGIN_DEBUG").unwrap_or(false);
+        let startup_autologin_force = parse_bool_env("STARTUP_AUTOLOGIN_FORCE").unwrap_or(false);
+
+        Ok(Self {
+            server_addr,
+            database_url,
+            kite_callback_url,
+            os_type,
+            startup_autologin_user_id,
+            startup_autologin_os_type,
+            startup_autologin_debug,
+            startup_autologin_force,
+        })
+    }
 }
 
 fn parse_bool_env(key: &str) -> Option<bool> {

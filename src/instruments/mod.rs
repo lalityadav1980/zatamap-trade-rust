@@ -5,6 +5,7 @@ use crate::{
 };
 use chrono::{Duration, Local, NaiveDate};
 use std::collections::{HashMap, HashSet};
+use tracing::info;
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct KiteInstrumentCsvRow {
@@ -96,37 +97,12 @@ pub async fn refresh_trade_instruments(
     let today = Local::now().date_naive();
     let expiry_end = expiry_days.map(|d| today + Duration::days(d));
     if let Some(d) = expiry_days {
-        println!(
-            "Instruments: expiry filter enabled days={} window={}..={}",
-            d,
-            today,
-            expiry_end.unwrap()
-        );
+        info!(days = d, window_start = %today, window_end = %expiry_end.unwrap(), "instruments expiry filter enabled");
     }
 
-    println!("Instruments: fetching CSV from Kite...");
+    info!("instruments fetching CSV from Kite");
     let csv_text = kite.instruments_csv().await?;
-    println!(
-        "Instruments: downloaded CSV bytes={} elapsed_ms={}",
-        csv_text.len(),
-        started.elapsed().as_millis()
-    );
-    let mut rdr = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .flexible(true)
-        .from_reader(csv_text.as_bytes());
-
-    let mut rows: Vec<KiteInstrumentCsvRow> = Vec::new();
-    for rec in rdr.deserialize() {
-        let r: KiteInstrumentCsvRow = rec?;
-        rows.push(r);
-    }
-    println!(
-        "Instruments: parsed_rows={} elapsed_ms={}",
-        rows.len(),
-        started.elapsed().as_millis()
-    );
-
+    info!(bytes = csv_text.len(), elapsed_ms = started.elapsed().as_millis() as u64, "instruments CSV downloaded");
     let allowed_names: HashSet<&'static str> = HashSet::from([
         "MIDCPNIFTY",
         "NIFTY",
@@ -140,10 +116,18 @@ pub async fn refresh_trade_instruments(
     // Same specific tokens as Python.
     let specific_tokens: HashSet<i32> = HashSet::from([256265, 260105, 288009, 257801, 265]);
 
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(csv_text.as_bytes());
+
+    let mut parsed_rows: usize = 0;
     let mut selected: Vec<KiteInstrumentCsvRow> = Vec::new();
     let mut selected_specific: usize = 0;
     let mut selected_index_opts: usize = 0;
-    for r in rows {
+    for rec in rdr.deserialize() {
+        let r: KiteInstrumentCsvRow = rec?;
+        parsed_rows += 1;
         let is_specific = specific_tokens.contains(&r.instrument_token);
 
         let name_ok = r
@@ -184,12 +168,14 @@ pub async fn refresh_trade_instruments(
         }
     }
 
-    println!(
-        "Instruments: selected_total={} selected_specific={} selected_index_opts={} elapsed_ms={}",
-        selected.len(),
-        selected_specific,
-        selected_index_opts,
-        started.elapsed().as_millis()
+    info!(parsed_rows = parsed_rows, elapsed_ms = started.elapsed().as_millis() as u64, "instruments CSV parsed");
+
+    info!(
+        selected_total = selected.len(),
+        selected_specific = selected_specific,
+        selected_index_opts = selected_index_opts,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "instruments selected"
     );
 
     // Python overwrites name + symbol_full_name for these tokens.
@@ -258,11 +244,7 @@ pub async fn refresh_trade_instruments(
         });
     }
 
-    println!(
-        "Instruments: writing to Postgres (delete + upsert) rows={} elapsed_ms={}",
-        upserts.len(),
-        started.elapsed().as_millis()
-    );
+    info!(rows = upserts.len(), elapsed_ms = started.elapsed().as_millis() as u64, "instruments writing to Postgres");
 
     let use_bulk_copy = std::env::var("INSTRUMENT_BULK_COPY")
         .ok()
@@ -272,10 +254,7 @@ pub async fn refresh_trade_instruments(
     // If we're filtering by expiry window, only refresh the selected tokens (don't wipe the whole table).
     let delete_all = expiry_end.is_none();
     if use_bulk_copy {
-        println!(
-            "Instruments: using bulk COPY (delete_all={})",
-            delete_all
-        );
+        info!(delete_all = delete_all, "instruments using bulk COPY");
     }
 
     // Optional optimization: if every selected instrument_token already exists in DB, skip delete/upsert.
@@ -289,18 +268,10 @@ pub async fn refresh_trade_instruments(
         if !tokens.is_empty() {
             let existing = instrument_dao::count_existing_instrument_tokens(db, &tokens).await?;
             if existing as usize == tokens.len() {
-                println!(
-                    "Instruments: skip DB write (all tokens already present) tokens={} elapsed_ms={}",
-                    tokens.len(),
-                    started.elapsed().as_millis()
-                );
+                info!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64, "instruments skip DB write (all tokens already present)");
                 return Ok(tokens.len() as u64);
             }
-            println!(
-                "Instruments: DB has {}/{} tokens; continuing with upsert",
-                existing,
-                tokens.len()
-            );
+            info!(existing = existing, tokens = tokens.len(), "instruments DB token coverage; continuing");
         }
     }
 
@@ -311,10 +282,6 @@ pub async fn refresh_trade_instruments(
     } else {
         instrument_dao::replace_instruments_by_tokens(db, &upserts).await?
     };
-    println!(
-        "Instruments: done upserted_rows={} total_elapsed_ms={}",
-        n,
-        started.elapsed().as_millis()
-    );
+    info!(upserted_rows = n, total_elapsed_ms = started.elapsed().as_millis() as u64, "instruments done");
     Ok(n)
 }

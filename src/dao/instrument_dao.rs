@@ -1,6 +1,7 @@
 use crate::{core::AppError, db::Db};
 use bytes::Bytes;
 use futures_util::SinkExt;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct InstrumentUpsert {
@@ -38,16 +39,12 @@ pub async fn count_existing_instrument_tokens(db: &Db, tokens: &[i32]) -> Result
 pub async fn replace_all_instruments(db: &Db, instruments: &[InstrumentUpsert]) -> Result<u64, AppError> {
     let client = db.client();
     let started = std::time::Instant::now();
-    println!("InstrumentDAO: BEGIN replace_all_instruments rows={}", instruments.len());
+    info!(rows = instruments.len(), "instrument replace_all begin");
     client.batch_execute("BEGIN").await?;
 
     let r: Result<u64, AppError> = async {
         let deleted = client.execute("DELETE FROM trade.instrument", &[]).await?;
-        println!(
-            "InstrumentDAO: deleted_rows={} elapsed_ms={}",
-            deleted,
-            started.elapsed().as_millis()
-        );
+        info!(deleted_rows = deleted, elapsed_ms = started.elapsed().as_millis() as u64, "instrument delete_all done");
 
                 let stmt = client
                         .prepare(
@@ -135,11 +132,7 @@ ON CONFLICT (instrument_token) DO UPDATE SET
                 .await?;
 
             if n % 5_000 == 0 {
-                println!(
-                    "InstrumentDAO: upsert_progress rows={} elapsed_ms={}",
-                    n,
-                    started.elapsed().as_millis()
-                );
+                info!(rows = n, elapsed_ms = started.elapsed().as_millis() as u64, "instrument upsert progress");
             }
         }
 
@@ -150,20 +143,12 @@ ON CONFLICT (instrument_token) DO UPDATE SET
     match r {
         Ok(n) => {
             client.batch_execute("COMMIT").await?;
-            println!(
-                "InstrumentDAO: COMMIT upserted_rows={} total_elapsed_ms={}",
-                n,
-                started.elapsed().as_millis()
-            );
+            info!(upserted_rows = n, total_elapsed_ms = started.elapsed().as_millis() as u64, "instrument replace_all commit");
             Ok(n)
         }
         Err(e) => {
             let _ = client.batch_execute("ROLLBACK").await;
-            println!(
-                "InstrumentDAO: ROLLBACK error='{}' total_elapsed_ms={}",
-                e,
-                started.elapsed().as_millis()
-            );
+            info!(error = %e, total_elapsed_ms = started.elapsed().as_millis() as u64, "instrument replace_all rollback");
             Err(e)
         }
     }
@@ -214,10 +199,7 @@ pub async fn replace_instruments_by_tokens(
 
     let client = db.client();
     let started = std::time::Instant::now();
-    println!(
-        "InstrumentDAO: BEGIN replace_instruments_by_tokens rows={}",
-        instruments.len()
-    );
+    info!(rows = instruments.len(), "instrument replace_by_tokens begin");
     client.batch_execute("BEGIN").await?;
 
     let r: Result<u64, AppError> = async {
@@ -228,11 +210,7 @@ pub async fn replace_instruments_by_tokens(
                 &[&tokens],
             )
             .await?;
-        println!(
-            "InstrumentDAO: deleted_rows={} elapsed_ms={}",
-            deleted,
-            started.elapsed().as_millis()
-        );
+        info!(deleted_rows = deleted, elapsed_ms = started.elapsed().as_millis() as u64, "instrument delete_by_tokens done");
 
         let stmt = client
             .prepare(
@@ -320,11 +298,7 @@ ON CONFLICT (instrument_token) DO UPDATE SET
                 .await?;
 
             if n % 5_000 == 0 {
-                println!(
-                    "InstrumentDAO: upsert_progress rows={} elapsed_ms={}",
-                    n,
-                    started.elapsed().as_millis()
-                );
+                info!(rows = n, elapsed_ms = started.elapsed().as_millis() as u64, "instrument upsert progress");
             }
         }
         Ok(n)
@@ -334,23 +308,142 @@ ON CONFLICT (instrument_token) DO UPDATE SET
     match r {
         Ok(n) => {
             client.batch_execute("COMMIT").await?;
-            println!(
-                "InstrumentDAO: COMMIT upserted_rows={} total_elapsed_ms={}",
-                n,
-                started.elapsed().as_millis()
-            );
+            info!(upserted_rows = n, total_elapsed_ms = started.elapsed().as_millis() as u64, "instrument replace_by_tokens commit");
             Ok(n)
         }
         Err(e) => {
             let _ = client.batch_execute("ROLLBACK").await;
-            println!(
-                "InstrumentDAO: ROLLBACK error='{}' total_elapsed_ms={}",
-                e,
-                started.elapsed().as_millis()
-            );
+            info!(error = %e, total_elapsed_ms = started.elapsed().as_millis() as u64, "instrument replace_by_tokens rollback");
             Err(e)
         }
     }
+}
+
+/// Fetch NIFTY weekly option tokens for the *nearest* expiry within the window.
+///
+/// This is intended for websocket subscriptions where you only want the current
+/// weekly series (similar to Python's `get_next_nifty_weekly_series_df()`).
+///
+/// Selection logic:
+/// - Underlying: `name = 'NIFTY'`
+/// - Options only: `instrument_type IN ('CE','PE')` and `exchange = 'NFO'`
+/// - Expiry window: [today, today + expiry_days]
+/// - Then pick the minimum expiry date in that window (single series)
+pub async fn fetch_nifty_current_week_option_tokens(
+    db: &Db,
+    expiry_days: i32,
+) -> Result<(Option<String>, Vec<i32>), AppError> {
+    let expiry_days = expiry_days.clamp(1, 14);
+    let client = db.client();
+
+    let expiry_row = client
+        .query_opt(
+            r#"
+SELECT (MIN(expiry)::date)::text
+FROM trade.instrument
+WHERE exchange = 'NFO'
+  AND instrument_type IN ('CE','PE')
+  AND name = 'NIFTY'
+  AND expiry >= CURRENT_DATE
+  AND expiry <= (CURRENT_DATE + ($1::int * INTERVAL '1 day'))
+"#,
+            &[&expiry_days],
+        )
+        .await?;
+
+    let Some(row) = expiry_row else {
+        warn!(expiry_days = expiry_days, "no NIFTY options found in expiry window");
+        return Ok((None, vec![]));
+    };
+
+    let expiry: Option<String> = row.get(0);
+    let Some(expiry) = expiry.filter(|s| !s.trim().is_empty()) else {
+        warn!(expiry_days = expiry_days, "no NIFTY expiry in window");
+        return Ok((None, vec![]));
+    };
+
+    let rows = client
+        .query(
+            r#"
+SELECT instrument_token
+FROM trade.instrument
+WHERE exchange = 'NFO'
+  AND instrument_type IN ('CE','PE')
+  AND name = 'NIFTY'
+    AND expiry = $1::text::date
+ORDER BY instrument_token
+"#,
+            &[&expiry],
+        )
+        .await?;
+
+    let mut tokens = Vec::with_capacity(rows.len());
+    for r in rows {
+        let t: i32 = r.get(0);
+        tokens.push(t);
+    }
+
+    info!(expiry = %expiry, tokens = tokens.len(), "selected current-week NIFTY option tokens");
+    Ok((Some(expiry), tokens))
+}
+
+/// Minimal metadata required to build a token→tradingsymbol map and option math inputs.
+#[derive(Debug, Clone)]
+pub struct InstrumentMetaRow {
+    pub instrument_token: i32,
+    pub tradingsymbol: String,
+    pub instrument_type: String,
+    pub expiry: Option<String>,
+    pub strike: Option<f64>,
+}
+
+/// Fetch NIFTY weekly option *metadata* for the nearest expiry within the window.
+///
+/// This returns enough fields to:
+/// - map token → tradingsymbol (for logging + downstream correlation)
+/// - keep strike/expiry for future greek calculations
+pub async fn fetch_nifty_current_week_option_meta(
+    db: &Db,
+    expiry_days: i32,
+) -> Result<(Option<String>, Vec<InstrumentMetaRow>), AppError> {
+    let (expiry, _tokens) = fetch_nifty_current_week_option_tokens(db, expiry_days).await?;
+    let Some(expiry) = expiry else {
+        return Ok((None, vec![]));
+    };
+
+    let client = db.client();
+    let rows = client
+        .query(
+            r#"
+SELECT instrument_token,
+       COALESCE(tradingsymbol, '') as tradingsymbol,
+       COALESCE(instrument_type, '') as instrument_type,
+       expiry::text as expiry,
+             strike::float8 as strike
+FROM trade.instrument
+WHERE exchange = 'NFO'
+  AND instrument_type IN ('CE','PE')
+  AND name = 'NIFTY'
+  AND expiry = $1::text::date
+ORDER BY instrument_token
+"#,
+            &[&expiry],
+        )
+        .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(InstrumentMetaRow {
+            instrument_token: r.get::<_, i32>(0),
+            tradingsymbol: r.get::<_, String>(1),
+            instrument_type: r.get::<_, String>(2),
+            expiry: r.get::<_, Option<String>>(3),
+            strike: r.get::<_, Option<f64>>(4),
+        });
+    }
+
+    info!(expiry = %expiry, rows = out.len(), "selected current-week NIFTY option meta");
+    Ok((Some(expiry), out))
 }
 
 pub async fn replace_instruments_copy(
@@ -364,21 +457,13 @@ pub async fn replace_instruments_copy(
 
     let client = db.client();
     let started = std::time::Instant::now();
-    println!(
-        "InstrumentDAO: BEGIN replace_instruments_copy rows={} delete_all={}",
-        instruments.len(),
-        delete_all
-    );
+    info!(rows = instruments.len(), delete_all = delete_all, "instrument copy begin");
     client.batch_execute("BEGIN").await?;
 
     let r: Result<u64, AppError> = async {
         if delete_all {
             let deleted = client.execute("DELETE FROM trade.instrument", &[]).await?;
-            println!(
-                "InstrumentDAO: deleted_rows={} elapsed_ms={}",
-                deleted,
-                started.elapsed().as_millis()
-            );
+            info!(deleted_rows = deleted, elapsed_ms = started.elapsed().as_millis() as u64, "instrument delete_all done");
         } else {
             let tokens: Vec<i32> = instruments.iter().map(|i| i.instrument_token).collect();
             let deleted = client
@@ -387,11 +472,7 @@ pub async fn replace_instruments_copy(
                     &[&tokens],
                 )
                 .await?;
-            println!(
-                "InstrumentDAO: deleted_rows={} elapsed_ms={}",
-                deleted,
-                started.elapsed().as_millis()
-            );
+            info!(deleted_rows = deleted, elapsed_ms = started.elapsed().as_millis() as u64, "instrument delete_by_tokens done");
         }
 
         // Stage into a temp table (all TEXT) so COPY stays simple and the final insert is set-based.
@@ -452,11 +533,7 @@ CREATE TEMP TABLE tmp_instruments (
             }
 
             if sent_rows % 25_000 == 0 {
-                println!(
-                    "InstrumentDAO: copy_progress rows={} elapsed_ms={}",
-                    sent_rows,
-                    started.elapsed().as_millis()
-                );
+                info!(rows = sent_rows, elapsed_ms = started.elapsed().as_millis() as u64, "instrument copy progress");
             }
         }
 
@@ -465,11 +542,7 @@ CREATE TEMP TABLE tmp_instruments (
         }
 
         let copied_rows = sink.as_mut().finish().await?;
-        println!(
-            "InstrumentDAO: copy_done rows={} elapsed_ms={}",
-            copied_rows,
-            started.elapsed().as_millis()
-        );
+        info!(rows = copied_rows, elapsed_ms = started.elapsed().as_millis() as u64, "instrument copy done");
 
         // Set-based insert. (Delete already handled, so no ON CONFLICT needed.)
         let inserted = client
@@ -514,11 +587,7 @@ FROM tmp_instruments
             )
             .await?;
 
-        println!(
-            "InstrumentDAO: bulk_inserted_rows={} elapsed_ms={}",
-            inserted,
-            started.elapsed().as_millis()
-        );
+        info!(inserted_rows = inserted, elapsed_ms = started.elapsed().as_millis() as u64, "instrument bulk insert done");
         Ok(inserted)
     }
     .await;
@@ -526,20 +595,12 @@ FROM tmp_instruments
     match r {
         Ok(n) => {
             client.batch_execute("COMMIT").await?;
-            println!(
-                "InstrumentDAO: COMMIT inserted_rows={} total_elapsed_ms={}",
-                n,
-                started.elapsed().as_millis()
-            );
+            info!(inserted_rows = n, total_elapsed_ms = started.elapsed().as_millis() as u64, "instrument copy commit");
             Ok(n)
         }
         Err(e) => {
             let _ = client.batch_execute("ROLLBACK").await;
-            println!(
-                "InstrumentDAO: ROLLBACK error='{}' total_elapsed_ms={}",
-                e,
-                started.elapsed().as_millis()
-            );
+            info!(error = %e, total_elapsed_ms = started.elapsed().as_millis() as u64, "instrument copy rollback");
             Err(e)
         }
     }

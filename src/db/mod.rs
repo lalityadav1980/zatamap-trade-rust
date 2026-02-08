@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio_postgres::{Client, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use rustls::client::{ServerCertVerifier, ServerCertVerified};
+use tracing::warn;
 
 pub struct Db {
     client: Arc<Client>,
@@ -113,7 +114,7 @@ fn make_rustls_connector(database_url: &str) -> MakeRustlsConnect {
     // To keep a secure default, we only disable cert verification when the user
     // explicitly opts in.
     if sslmode(database_url).as_deref() == Some("require") && parse_bool_env("PGTLS_SKIP_VERIFY") {
-        println!("DB: WARNING PGTLS_SKIP_VERIFY=1 (TLS cert verification disabled)");
+        warn!("DB: WARNING PGTLS_SKIP_VERIFY=1 (TLS cert verification disabled)");
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(NoCertificateVerification));

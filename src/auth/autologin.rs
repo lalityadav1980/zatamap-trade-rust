@@ -10,6 +10,7 @@ use sha1::Sha1;
 use std::process::Child;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{debug, info, warn};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AutoLoginOptions {
@@ -38,7 +39,7 @@ pub async fn maybe_autologin_for_os(
 ) -> Result<(), AppError> {
     let login = profile_dao::get_user_zerodha_login_for_os(&state.db, user_id, os_type).await?;
     let Some(login) = login else {
-        println!("AutoLogin: user not found in trade.profile: {user_id}");
+        warn!(user_id = user_id, "autologin user not found in trade.profile");
         return Ok(());
     };
 
@@ -48,11 +49,11 @@ pub async fn maybe_autologin_for_os(
         .map(|s| !s.is_empty())
         .unwrap_or(false);
     if has_token && !options.force {
-        println!("AutoLogin: existing access_token present for user={user_id}");
+        info!(user_id = user_id, "autologin skipped (access_token exists)");
         return Ok(());
     }
     if has_token && options.force {
-        println!("AutoLogin: forcing re-login even though access_token exists for user={user_id}");
+        info!(user_id = user_id, "autologin forced (access_token exists)");
     }
 
     let chromedriver_url_env = std::env::var("CHROMEDRIVER_URL").ok();
@@ -84,10 +85,7 @@ pub async fn maybe_autologin_for_os(
     // This mirrors your Python function `login_and_get_tokens`.
     // Important: we pass the per-user redirect_url into Kite login so the final redirect contains it.
     let kite_connect_login_url = auth::login_url(&login.api_key, &redirect_url);
-    println!("AutoLogin: starting selenium flow for user={user_id}");
-    println!("AutoLogin: os_type={effective_os}");
-    println!("AutoLogin: headless={headless} debug={}", options.debug);
-    println!("AutoLogin: redirect_url={redirect_url}");
+    info!(user_id = user_id, os_type = effective_os, headless = headless, debug = options.debug, redirect_url = %redirect_url, "autologin start");
 
     let mut spawned: Option<Child> = None;
     let chromedriver_url = chromedriver_url_env
@@ -114,7 +112,7 @@ pub async fn maybe_autologin_for_os(
                 );
 
                 if let Some(path) = spawn_path.as_deref() {
-                    println!("AutoLogin: chromedriver not reachable; spawning chromedriver='{path}'");
+                    info!(user_id = user_id, chromedriver_path = path, port = chromedriver_port, "chromedriver spawn");
                     spawned = Some(spawn_chromedriver(path, chromedriver_port)?);
                     tokio::time::sleep(Duration::from_millis(700)).await;
                     WebDriver::connect_with_options(&chromedriver_url, selenium_options.clone()).await?
@@ -127,7 +125,7 @@ pub async fn maybe_autologin_for_os(
         }
     };
 
-    println!("AutoLogin: chromedriver={chromedriver_url}");
+    info!(user_id = user_id, chromedriver_url = chromedriver_url, "chromedriver connected");
     let password = login
         .zerodha_password
         .as_deref()
@@ -173,20 +171,15 @@ pub async fn maybe_autologin_for_os(
         return Err(AppError::KiteApi("User not found while updating token".to_string()));
     }
 
-    println!("AutoLogin: updated access_token in DB for user={user_id}");
+    info!(user_id = user_id, "autologin updated access_token in DB");
 
     // ------------------------------------------------------------ housekeeping
     // Mirror the Python flow: after successful login, refresh instruments into Postgres.
-    println!("AutoLogin: housekeeping start (refresh trade.instrument) user={user_id}");
+    info!(user_id = user_id, "housekeeping start (refresh trade.instrument)");
     let housekeeping_started = std::time::Instant::now();
     let kite = crate::kite::client::KiteClient::new(&login.api_key, &session.access_token)?;
     let n = crate::instruments::refresh_trade_instruments(&state.db, &kite).await?;
-    println!(
-        "AutoLogin: housekeeping done refreshed_rows={} elapsed_ms={} user={}",
-        n,
-        housekeeping_started.elapsed().as_millis(),
-        user_id
-    );
+    info!(user_id = user_id, refreshed_rows = n, elapsed_ms = housekeeping_started.elapsed().as_millis() as u64, "housekeeping done");
     Ok(())
 }
 async fn run_login_flow(
@@ -287,7 +280,7 @@ async fn run_login_flow(
         let _ = write_debug_screenshot(driver, user_id).await;
         let _ = write_debug_page_source(driver, user_id).await;
         let cur = driver.current_url().await.unwrap_or_default();
-        println!("AutoLogin[debug]: last_url={cur}");
+        debug!(last_url = cur.as_str(), "autologin debug");
     }
 
     r
@@ -381,7 +374,7 @@ async fn write_debug_screenshot(driver: &WebDriver, user_id: &str) -> Result<(),
     let file = format!("autologin_failure_{user_id}_{ts}.png");
     std::fs::write(&file, bytes)
         .map_err(|e| AppError::KiteApi(format!("Failed to write screenshot '{file}': {e}")))?;
-    println!("AutoLogin[debug]: wrote screenshot: {file}");
+    debug!(file = file.as_str(), "autologin debug wrote screenshot");
     Ok(())
 }
 
@@ -394,7 +387,7 @@ async fn write_debug_page_source(driver: &WebDriver, user_id: &str) -> Result<()
     let file = format!("autologin_failure_{user_id}_{ts}.html");
     std::fs::write(&file, html)
         .map_err(|e| AppError::KiteApi(format!("Failed to write page source '{file}': {e}")))?;
-    println!("AutoLogin[debug]: wrote page source: {file}");
+    debug!(file = file.as_str(), "autologin debug wrote page source");
     Ok(())
 }
 
@@ -439,7 +432,7 @@ fn choose_chromedriver_spawn_path(
             if Path::new(p_trim).exists() {
                 return Some(p_trim.to_string());
             }
-            println!("AutoLogin: ignoring CHROMEDRIVER_PATH (not found): {p_trim}");
+            warn!(path = p_trim, "ignoring CHROMEDRIVER_PATH (not found)");
             if let Some(pinned) = find_repo_drivers_chromedriver(os_type) {
                 return Some(pinned);
             }
