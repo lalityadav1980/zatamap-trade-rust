@@ -10,6 +10,7 @@ This repository contains:
 	- receives Kite callback and stores tokens in Postgres (`/api/kite/callback`)
 - A CLI that can call Kite REST directly (`profile`, `holdings`)
 - An optional Selenium-based auto-login flow that can update `trade.profile.access_token`
+- A Kite WebSocket ticker client (`ticker`, `e2e`) that subscribes to current-week NIFTY options + NIFTY index in `FULL` mode and processes ticks continuously
 
 > Security note: do not commit real secrets (API keys, access tokens, DB passwords).
 > Use `.env` locally (already gitignored) and store per-user Kite/Zerodha values in Postgres.
@@ -287,6 +288,50 @@ REST calls use header: `Authorization: token <api_key>:<access_token>`.
 
 ---
 
+## Ticker (WebSocket, DB-backed)
+
+The ticker reads `api_key` + `access_token` from Postgres (`trade.profile`) for the given user and subscribes to:
+
+- current-week NIFTY option tokens (selected from the DB)
+- plus NIFTY index token `256265`
+
+It connects to Kite ticker WebSocket in `FULL` mode, decodes binary ticks, and updates in-memory state continuously until you stop it (Ctrl+C) or you set `TICKER_RUN_SECS`.
+
+Run ticker:
+
+```bash
+cargo run -- ticker YOUR_USER_ID
+```
+
+Single-process end-to-end (autologin then ticker):
+
+```bash
+cargo run -- e2e YOUR_USER_ID
+```
+
+Tick log controls:
+
+- Default: tick printing is ON (rate-limited)
+- Disable: `--no-print-ticks` (still processes/stores ticks)
+- Enable: `--print-ticks`
+
+Env vars:
+
+```dotenv
+# Auto-exit after N seconds (smoke test). If unset/0, runs until Ctrl+C.
+TICKER_RUN_SECS=0
+
+# Tick printing (default 1/on)
+TICK_LOG_FULL=1
+
+# Rate limit for tick printing (default 500ms)
+TICK_LOG_INTERVAL_MS=500
+```
+
+More details: [docs/ticker.md](docs/ticker.md)
+
+---
+
 ## AutoLogin (Selenium)
 
 This mode uses Chromedriver + Chrome to log in and extract a `request_token`, then exchanges it and stores tokens into Postgres.
@@ -366,4 +411,6 @@ Selenium-related env vars:
 - DB connection errors: confirm `DATABASE_URL` (or `PG*`) and that Postgres is reachable.
 - `/api/kite/login_url` returns 404 User not found: insert the `(userid, os_type)` row in `trade.profile`.
 - Kite redirect errors about domain mismatch: ensure your Kite app’s Redirect URL matches `KITE_CALLBACK_URL` (including scheme/host/port/path).
+- Ticker/WebSocket 403 Forbidden: access token is invalid/expired for that user; run `autologin` (or complete the callback flow) to refresh it.
+- Ticker shows `received_tokens>0` but no tick lines: tick printing is disabled (`TICK_LOG_FULL=0` or `--no-print-ticks`) or rate-limited by `TICK_LOG_INTERVAL_MS`.
 - Autologin fails to create WebDriver session: verify `chromedriver --version` matches your installed Chrome/Chromium major version.
