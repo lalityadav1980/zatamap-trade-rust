@@ -104,23 +104,35 @@ pub async fn maybe_autologin_for_os(
         Ok(d) => d,
         Err(e) => {
             // Best-effort: if chromedriver isn't already running and we have a per-user path, spawn it.
-            if !chromedriver_url_from_env {
-                let spawn_path = choose_chromedriver_spawn_path(
-                    chromedriver_path_override.clone(),
-                    login.chromedriver_path.clone(),
-                    effective_os,
-                );
-
-                if let Some(path) = spawn_path.as_deref() {
-                    info!(user_id = user_id, chromedriver_path = path, port = chromedriver_port, "chromedriver spawn");
-                    spawned = Some(spawn_chromedriver(path, chromedriver_port)?);
-                    tokio::time::sleep(Duration::from_millis(700)).await;
-                    WebDriver::connect_with_options(&chromedriver_url, selenium_options.clone()).await?
-                } else {
-                    return Err(e);
-                }
-            } else {
+            if chromedriver_url_from_env {
                 return Err(e);
+            }
+
+            let spawn_path = choose_chromedriver_spawn_path(
+                chromedriver_path_override.clone(),
+                login.chromedriver_path.clone(),
+                effective_os,
+            );
+
+            let Some(path) = spawn_path.as_deref() else {
+                return Err(e);
+            };
+
+            info!(user_id = user_id, chromedriver_path = path, port = chromedriver_port, "chromedriver spawn");
+            let mut child = spawn_chromedriver(path, chromedriver_port)?;
+
+            // Chromedriver can take a moment to bind its port and accept /session.
+            // Avoid flapping systemd restarts due to a too-eager connect attempt.
+            match connect_webdriver_with_retry(&chromedriver_url, chromedriver_port, selenium_options.clone(), Duration::from_secs(12)).await {
+                Ok(d) => {
+                    spawned = Some(child);
+                    d
+                }
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(err);
+                }
             }
         }
     };
@@ -181,6 +193,61 @@ pub async fn maybe_autologin_for_os(
     let n = crate::instruments::refresh_trade_instruments(&state.db, &kite).await?;
     info!(user_id = user_id, refreshed_rows = n, elapsed_ms = housekeeping_started.elapsed().as_millis() as u64, "housekeeping done");
     Ok(())
+}
+
+async fn connect_webdriver_with_retry(
+    chromedriver_url: &str,
+    port: u16,
+    options: selenium::SeleniumOptions,
+    timeout: Duration,
+) -> Result<WebDriver, AppError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(150);
+
+    // First wait for TCP port to become connectable (chromedriver ready to accept HTTP).
+    loop {
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(s) => {
+                drop(s);
+                break;
+            }
+            Err(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(AppError::KiteApi(format!(
+                        "chromedriver did not open port {port} within {}s",
+                        timeout.as_secs()
+                    )));
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, Duration::from_millis(900));
+            }
+        }
+    }
+
+    // Then retry /session creation for a little while; chromedriver may accept TCP but still be initializing.
+    let mut backoff = Duration::from_millis(150);
+    loop {
+        match WebDriver::connect_with_options(chromedriver_url, options.clone()).await {
+            Ok(d) => return Ok(d),
+            Err(e) => {
+                if !is_transient_chromedriver_connect_error(&e) {
+                    return Err(e);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, Duration::from_millis(900));
+            }
+        }
+    }
+}
+
+fn is_transient_chromedriver_connect_error(e: &AppError) -> bool {
+    match e {
+        AppError::Http(err) => err.is_connect() || err.is_timeout(),
+        _ => false,
+    }
 }
 async fn run_login_flow(
     driver: &WebDriver,
