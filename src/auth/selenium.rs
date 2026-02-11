@@ -256,8 +256,11 @@ fn extract_session_id(v: &serde_json::Value) -> Option<String> {
 fn chrome_args(headless: bool) -> Vec<String> {
 	let mut args = vec![
 		"--no-sandbox".to_string(),
+		"--no-zygote".to_string(),
+		"--disable-extensions".to_string(),
 		"--disable-dev-shm-usage".to_string(),
 		"--disable-gpu".to_string(),
+		"--disable-features=VizDisplayCompositor".to_string(),
 		"--remote-debugging-pipe".to_string(),
 		"--window-size=1920,1080".to_string(),
 	];
