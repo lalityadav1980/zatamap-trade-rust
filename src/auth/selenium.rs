@@ -258,6 +258,7 @@ fn chrome_args(headless: bool) -> Vec<String> {
 		"--no-sandbox".to_string(),
 		"--disable-dev-shm-usage".to_string(),
 		"--disable-gpu".to_string(),
+		"--remote-debugging-pipe".to_string(),
 		"--window-size=1920,1080".to_string(),
 	];
 	if headless {
